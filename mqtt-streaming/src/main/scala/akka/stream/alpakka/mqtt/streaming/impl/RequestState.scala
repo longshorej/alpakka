@@ -9,14 +9,14 @@ import akka.NotUsed
 import akka.actor.typed.{ActorRef, Behavior, PostStop}
 import akka.actor.typed.scaladsl.Behaviors
 import akka.annotation.InternalApi
-import akka.stream.{Materializer, OverflowStrategy}
+import akka.stream.{Materializer, OverflowStrategy, QueueOfferResult}
 import akka.stream.scaladsl.{BroadcastHub, Keep, Source, SourceQueueWithComplete}
 import akka.util.ByteString
 
 import scala.annotation.tailrec
 import scala.concurrent.Promise
 import scala.util.control.NoStackTrace
-import scala.util.{Failure, Success}
+import scala.util.{Either, Failure, Success}
 
 /*
  * A producer manages the client state in relation to publishing to a server-side topic.
@@ -66,6 +66,10 @@ import scala.util.{Failure, Success}
   case object ReceivePubCompTimeout extends Event
   final case class PubCompReceivedFromRemote(local: Promise[ForwardPubComp]) extends Event
 
+  final case class QueueOfferCompleted(result: Either[Throwable, QueueOfferResult])
+      extends Event
+      with QueueOfferState.QueueOfferCompleted
+
   sealed abstract class Command
   sealed abstract class ForwardPublishingCommand extends Command
   final case class ForwardPublish(publish: Publish, packetId: Option[PacketId]) extends ForwardPublishingCommand
@@ -77,6 +81,8 @@ import scala.util.{Failure, Success}
   // State event handling
 
   def preparePublish(data: Start)(implicit mat: Materializer): Behavior[Event] = Behaviors.setup { context =>
+    import context.executionContext
+
     def requestPacketId(): Unit = {
       val reply = Promise[LocalPacketRouter.Registered]
       data.packetRouter ! LocalPacketRouter.Register(context.self.unsafeUpcast, reply)
@@ -90,18 +96,26 @@ import scala.util.{Failure, Success}
     requestPacketId()
 
     val (queue, source) = Source
-      .queue[ForwardPublishingCommand](1, OverflowStrategy.dropHead)
+      .queue[ForwardPublishingCommand](1, OverflowStrategy.backpressure)
       .toMat(BroadcastHub.sink)(Keep.both)
       .run()
+
     data.remote.success(source)
 
     Behaviors
       .receiveMessagePartial[Event] {
         case AcquiredPacketId(packetId) =>
-          queue.offer(ForwardPublish(data.publish, Some(packetId)))
-          publishUnacknowledged(
-            Publishing(queue, packetId, data.publish, data.publishData, data.packetRouter, data.settings)
+          queue
+            .offer(ForwardPublish(data.publish, Some(packetId)))
+            .onComplete(result => context.self.tell(QueueOfferCompleted(result.toEither)))
+
+          QueueOfferState.waitForQueueOfferCompleted(
+            publishUnacknowledged(
+              Publishing(queue, packetId, data.publish, data.publishData, data.packetRouter, data.settings)
+            ),
+            Seq.empty
           )
+
         case UnacquiredPacketId =>
           requestPacketId()
           Behaviors.same
@@ -119,22 +133,32 @@ import scala.util.{Failure, Success}
       timer.startSingleTimer(ReceivePubackrec, ReceivePubAckRecTimeout, data.settings.producerPubAckRecTimeout)
 
       Behaviors
-        .receiveMessagePartial[Event] {
-          case PubAckReceivedFromRemote(local)
+        .receive[Event] {
+          case (_, PubAckReceivedFromRemote(local))
               if data.publish.flags.contains(ControlPacketFlags.QoSAtLeastOnceDelivery) =>
             local.success(ForwardPubAck(data.publishData))
             Behaviors.stopped
-          case PubRecReceivedFromRemote(local)
+
+          case (_, PubRecReceivedFromRemote(local))
               if data.publish.flags.contains(ControlPacketFlags.QoSAtMostOnceDelivery) =>
             local.success(ForwardPubRec(data.publishData))
             timer.cancel(ReceivePubackrec)
             publishAcknowledged(data)
-          case ReceivePubAckRecTimeout =>
-            data.remote.offer(
-              ForwardPublish(data.publish.copy(flags = data.publish.flags | ControlPacketFlags.DUP),
-                             Some(data.packetId))
+
+          case (context, ReceivePubAckRecTimeout) =>
+            import context.executionContext
+
+            data.remote
+              .offer(
+                ForwardPublish(data.publish.copy(flags = data.publish.flags | ControlPacketFlags.DUP),
+                               Some(data.packetId))
+              )
+              .onComplete(result => context.self.tell(QueueOfferCompleted(result.toEither)))
+
+            QueueOfferState.waitForQueueOfferCompleted(
+              publishUnacknowledged(data),
+              Seq.empty
             )
-            publishUnacknowledged(data)
         }
         .receiveSignal {
           case (_, PostStop) =>
@@ -149,23 +173,40 @@ import scala.util.{Failure, Success}
     timer =>
       timer.startSingleTimer(ReceivePubrel, ReceivePubCompTimeout, data.settings.producerPubCompTimeout)
 
-      data.remote.offer(ForwardPubRel(data.publish, data.packetId))
+      Behaviors.setup { context =>
+        import context.executionContext
 
-      Behaviors
-        .receiveMessagePartial[Event] {
-          case PubCompReceivedFromRemote(local) =>
-            local.success(ForwardPubComp(data.publishData))
-            Behaviors.stopped
-          case ReceivePubCompTimeout =>
-            data.remote.offer(ForwardPubRel(data.publish, data.packetId))
-            publishAcknowledged(data)
-        }
-        .receiveSignal {
-          case (_, PostStop) =>
-            data.packetRouter ! LocalPacketRouter.Unregister(data.packetId)
-            data.remote.complete()
-            Behaviors.same
-        }
+        data.remote
+          .offer(ForwardPubRel(data.publish, data.packetId))
+          .onComplete(result => context.self.tell(QueueOfferCompleted(result.toEither)))
+
+        QueueOfferState.waitForQueueOfferCompleted(
+          Behaviors
+            .receiveMessagePartial[Event] {
+              case PubCompReceivedFromRemote(local) =>
+                local.success(ForwardPubComp(data.publishData))
+                Behaviors.stopped
+
+              case ReceivePubCompTimeout =>
+                data.remote
+                  .offer(ForwardPubRel(data.publish, data.packetId))
+                  .onComplete(result => context.self.tell(QueueOfferCompleted(result.toEither)))
+
+                QueueOfferState.waitForQueueOfferCompleted(
+                  publishAcknowledged(data),
+                  Seq.empty
+                )
+            }
+            .receiveSignal {
+              case (_, PostStop) =>
+                data.packetRouter ! LocalPacketRouter.Unregister(data.packetId)
+                data.remote.complete()
+                Behaviors.same
+            },
+          Seq.empty
+        )
+      }
+
   }
 }
 
