@@ -7,7 +7,7 @@ package impl
 
 import akka.NotUsed
 import akka.actor.typed._
-import akka.actor.typed.scaladsl.{ActorContext, Behaviors}
+import akka.actor.typed.scaladsl.{ActorContext, Behaviors, StashBuffer}
 import akka.annotation.InternalApi
 import akka.stream.{Materializer, OverflowStrategy, QueueOfferResult}
 import akka.stream.scaladsl.{BroadcastHub, Keep, Source, SourceQueueWithComplete}
@@ -50,7 +50,7 @@ import scala.util.{Either, Failure, Success}
             settings: MqttSessionSettings)(implicit mat: Materializer): Behavior[Event] =
     disconnected(
       Disconnected(
-        Vector.empty,
+        StashBuffer(Int.MaxValue),
         Map.empty,
         Map.empty,
         Vector.empty,
@@ -65,7 +65,7 @@ import scala.util.{Either, Failure, Success}
 
   // Our FSM data, FSM events and commands emitted by the FSM
 
-  sealed abstract class Data(val stash: Seq[Event],
+  sealed abstract class Data(val stash: StashBuffer[Event],
                              val activeConsumers: Map[String, ActorRef[Consumer.Event]],
                              val activeProducers: Map[String, ActorRef[Producer.Event]],
                              val pendingLocalPublications: Seq[(String, PublishReceivedLocally)],
@@ -76,7 +76,7 @@ import scala.util.{Either, Failure, Success}
                              val unsubscriberPacketRouter: ActorRef[LocalPacketRouter.Request[Unsubscriber.Event]],
                              val settings: MqttSessionSettings)
   final case class Disconnected(
-      override val stash: Seq[Event],
+      override val stash: StashBuffer[Event],
       override val activeConsumers: Map[String, ActorRef[Consumer.Event]],
       override val activeProducers: Map[String, ActorRef[Producer.Event]],
       override val pendingLocalPublications: Seq[(String, PublishReceivedLocally)],
@@ -103,7 +103,7 @@ import scala.util.{Either, Failure, Success}
       connect: Connect,
       connectData: ConnectData,
       remote: SourceQueueWithComplete[ForwardConnectCommand],
-      override val stash: Seq[Event],
+      override val stash: StashBuffer[Event],
       override val activeConsumers: Map[String, ActorRef[Consumer.Event]],
       override val activeProducers: Map[String, ActorRef[Producer.Event]],
       override val pendingLocalPublications: Seq[(String, PublishReceivedLocally)],
@@ -131,7 +131,7 @@ import scala.util.{Either, Failure, Success}
       keepAlive: FiniteDuration,
       pendingPingResp: Boolean,
       remote: SourceQueueWithComplete[ForwardConnectCommand],
-      override val stash: Seq[Event],
+      override val stash: StashBuffer[Event],
       override val activeConsumers: Map[String, ActorRef[Consumer.Event]],
       override val activeProducers: Map[String, ActorRef[Producer.Event]],
       override val pendingLocalPublications: Seq[(String, PublishReceivedLocally)],
@@ -233,8 +233,6 @@ import scala.util.{Either, Failure, Success}
     Behaviors
       .receivePartial[Event] {
         case (context, ConnectReceivedLocally(connectionId, connect, connectData, remote)) =>
-          import context.executionContext
-
           val (queue, source) = Source
             .queue[ForwardConnectCommand](data.settings.clientSendBufferSize, OverflowStrategy.backpressure)
             .toMat(BroadcastHub.sink)(Keep.both)
@@ -242,63 +240,64 @@ import scala.util.{Either, Failure, Success}
 
           remote.success(source)
 
-          queue
-            .offer(ForwardConnect)
-            .onComplete(result => context.self.tell(QueueOfferCompleted(connectionId, result.toEither)))
+          val nextState =
+            if (connect.connectFlags.contains(ConnectFlags.CleanSession)) {
+              context.children.foreach(context.stop)
 
-          val nextState = if (connect.connectFlags.contains(ConnectFlags.CleanSession)) {
-            context.children.foreach(context.stop)
-
-            serverConnect(
-              ConnectReceived(
-                connectionId,
-                connect,
-                connectData,
-                queue,
-                Vector.empty,
-                Map.empty,
-                Map.empty,
-                Vector.empty,
-                Vector.empty,
-                data.consumerPacketRouter,
-                data.producerPacketRouter,
-                data.subscriberPacketRouter,
-                data.unsubscriberPacketRouter,
-                data.settings
+              serverConnect(
+                ConnectReceived(
+                  connectionId,
+                  connect,
+                  connectData,
+                  queue,
+                  StashBuffer(Int.MaxValue),
+                  Map.empty,
+                  Map.empty,
+                  Vector.empty,
+                  Vector.empty,
+                  data.consumerPacketRouter,
+                  data.producerPacketRouter,
+                  data.subscriberPacketRouter,
+                  data.unsubscriberPacketRouter,
+                  data.settings
+                )
               )
-            )
-          } else {
-            data.activeProducers.values.foreach { producer =>
-              producer ! Producer.ReceiveConnect
+            } else {
+              data.activeProducers.values.foreach { producer =>
+                producer ! Producer.ReceiveConnect
+              }
+
+              serverConnect(
+                ConnectReceived(
+                  connectionId,
+                  connect,
+                  connectData,
+                  queue,
+                  StashBuffer(Int.MaxValue),
+                  data.activeConsumers,
+                  data.activeProducers,
+                  data.pendingLocalPublications,
+                  data.pendingRemotePublications,
+                  data.consumerPacketRouter,
+                  data.producerPacketRouter,
+                  data.subscriberPacketRouter,
+                  data.unsubscriberPacketRouter,
+                  data.settings
+                )
+              )
             }
 
-            serverConnect(
-              ConnectReceived(
-                connectionId,
-                connect,
-                connectData,
-                queue,
-                Vector.empty,
-                data.activeConsumers,
-                data.activeProducers,
-                data.pendingLocalPublications,
-                data.pendingRemotePublications,
-                data.consumerPacketRouter,
-                data.producerPacketRouter,
-                data.subscriberPacketRouter,
-                data.unsubscriberPacketRouter,
-                data.settings
-              )
-            )
-
-          }
-
-          QueueOfferState.waitForQueueOfferCompleted(nextState, stash = data.stash)
+          QueueOfferState.waitForQueueOfferCompleted(
+            queue.offer(ForwardConnect),
+            result => QueueOfferCompleted(connectionId, result.toEither),
+            nextState,
+            data.stash
+          )
 
         case (_, ConnectionLost(_)) =>
           Behaviors.same
         case (_, e) =>
-          disconnected(data.copy(stash = data.stash :+ e))
+          disconnected(data.copy(stash = data.stash.stash(e)))
       }
       .receiveSignal {
         case (_, _: Terminated) =>
@@ -310,20 +309,21 @@ import scala.util.{Either, Failure, Success}
   ): Behavior[Event] = {
     remote.complete()
 
-    data.stash.foreach(context.self.tell)
-
-    disconnected(
-      Disconnected(
-        Vector.empty,
-        data.activeConsumers,
-        data.activeProducers,
-        data.pendingLocalPublications,
-        data.pendingRemotePublications,
-        data.consumerPacketRouter,
-        data.producerPacketRouter,
-        data.subscriberPacketRouter,
-        data.unsubscriberPacketRouter,
-        data.settings
+    data.stash.unstashAll(
+      context,
+      disconnected(
+        Disconnected(
+          StashBuffer(Int.MaxValue),
+          data.activeConsumers,
+          data.activeProducers,
+          data.pendingLocalPublications,
+          data.pendingRemotePublications,
+          data.consumerPacketRouter,
+          data.producerPacketRouter,
+          data.subscriberPacketRouter,
+          data.unsubscriberPacketRouter,
+          data.settings
+        )
       )
     )
   }
@@ -347,27 +347,32 @@ import scala.util.{Either, Failure, Success}
           case (context, ConnAckReceivedFromRemote(_, connAck, local))
               if connAck.returnCode.contains(ConnAckReturnCode.ConnectionAccepted) =>
             local.success(ForwardConnAck(data.connectData))
-            data.stash.foreach(context.self.tell)
+
             timer.cancel(ReceiveConnAck)
-            serverConnected(
-              ConnAckReceived(
-                data.connectionId,
-                data.connect.connectFlags,
-                data.connect.keepAlive,
-                pendingPingResp = false,
-                data.remote,
-                Vector.empty,
-                data.activeConsumers,
-                data.activeProducers,
-                data.pendingLocalPublications,
-                data.pendingRemotePublications,
-                data.consumerPacketRouter,
-                data.producerPacketRouter,
-                data.subscriberPacketRouter,
-                data.unsubscriberPacketRouter,
-                data.settings
+
+            data.stash.unstashAll(
+              context,
+              serverConnected(
+                ConnAckReceived(
+                  data.connectionId,
+                  data.connect.connectFlags,
+                  data.connect.keepAlive,
+                  pendingPingResp = false,
+                  data.remote,
+                  StashBuffer(Int.MaxValue),
+                  data.activeConsumers,
+                  data.activeProducers,
+                  data.pendingLocalPublications,
+                  data.pendingRemotePublications,
+                  data.consumerPacketRouter,
+                  data.producerPacketRouter,
+                  data.subscriberPacketRouter,
+                  data.unsubscriberPacketRouter,
+                  data.settings
+                )
               )
             )
+
           case (context, ConnAckReceivedFromRemote(_, _, local)) =>
             local.success(ForwardConnAck(data.connectData))
             timer.cancel(ReceiveConnAck)
@@ -380,7 +385,7 @@ import scala.util.{Either, Failure, Success}
             timer.cancel(ReceiveConnAck)
             disconnect(context, data.remote, data)
           case (_, e) =>
-            serverConnect(data.copy(stash = data.stash :+ e))
+            serverConnect(data.copy(stash = data.stash.stash(e)))
         }
         .receiveSignal {
           case (_, _: Terminated) =>
@@ -487,15 +492,11 @@ import scala.util.{Either, Failure, Success}
 
           case (context, PublishReceivedLocally(publish, _))
               if (publish.flags & ControlPacketFlags.QoSReserved).underlying == 0 =>
-            import context.executionContext
-
-            data.remote
-              .offer(ForwardPublish(publish, None))
-              .onComplete(result => context.self.tell(QueueOfferCompleted(ByteString.empty, result.toEither)))
-
             QueueOfferState.waitForQueueOfferCompleted(
+              data.remote.offer(ForwardPublish(publish, None)),
+              result => QueueOfferCompleted(ByteString.empty, result.toEither),
               serverConnected(data),
-              stash = Seq.empty
+              stash = StashBuffer(Int.MaxValue)
             )
 
           case (context, prl @ PublishReceivedLocally(publish, publishData)) =>
@@ -546,27 +547,21 @@ import scala.util.{Either, Failure, Success}
             }
 
           case (context, ReceivedProducerPublishingCommand(Producer.ForwardPublish(publish, packetId))) =>
-            import context.executionContext
-
-            data.remote
-              .offer(ForwardPublish(publish, packetId))
-              .onComplete(result => context.self.tell(QueueOfferCompleted(ByteString.empty, result.toEither)))
-
             QueueOfferState.waitForQueueOfferCompleted(
+              data.remote
+                .offer(ForwardPublish(publish, packetId)),
+              result => QueueOfferCompleted(ByteString.empty, result.toEither),
               serverConnected(data, resetPingReqTimer = false),
-              stash = Seq.empty
+              stash = StashBuffer(Int.MaxValue)
             )
 
           case (context, ReceivedProducerPublishingCommand(Producer.ForwardPubRel(_, packetId))) =>
-            import context.executionContext
-
-            data.remote
-              .offer(ForwardPubRel(packetId))
-              .onComplete(result => context.self.tell(QueueOfferCompleted(ByteString.empty, result.toEither)))
-
             QueueOfferState.waitForQueueOfferCompleted(
+              data.remote
+                .offer(ForwardPubRel(packetId)),
+              result => QueueOfferCompleted(ByteString.empty, result.toEither),
               serverConnected(data, resetPingReqTimer = false),
-              stash = Seq.empty
+              stash = StashBuffer(Int.MaxValue)
             )
 
           case (context, SendPingReqTimeout(_)) if data.pendingPingResp =>
@@ -575,15 +570,12 @@ import scala.util.{Either, Failure, Success}
             disconnect(context, data.remote, data)
 
           case (context, SendPingReqTimeout(_)) =>
-            import context.executionContext
-
-            data.remote
-              .offer(ForwardPingReq)
-              .onComplete(result => context.self.tell(QueueOfferCompleted(ByteString.empty, result.toEither)))
-
             QueueOfferState.waitForQueueOfferCompleted(
+              data.remote
+                .offer(ForwardPingReq),
+              result => QueueOfferCompleted(ByteString.empty, result.toEither),
               serverConnected(data.copy(pendingPingResp = true)),
-              stash = Seq.empty
+              stash = StashBuffer(Int.MaxValue)
             )
 
           case (_, PingRespReceivedFromRemote(_, local)) =>
